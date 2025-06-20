@@ -112,102 +112,114 @@ class PolymarketAPI:
             await self.session.close()
             
     async def get_sports_markets(self) -> List[Dict]:
-        """Fetch only major league sports games, not random fights or events"""
+        """Fetch sports markets from Polymarket's API"""
         try:
             all_markets = []
             
-            # Major league team names to look for
-            nba_teams = [
-                'lakers', 'celtics', 'warriors', 'nets', 'knicks', 'bulls', 'heat', 
-                'bucks', 'suns', 'nuggets', 'clippers', 'sixers', '76ers', 'mavericks',
-                'spurs', 'raptors', 'hawks', 'cavaliers', 'pacers', 'pistons', 'magic',
-                'wizards', 'hornets', 'jazz', 'trail blazers', 'blazers', 'kings',
-                'pelicans', 'timberwolves', 'grizzlies', 'rockets', 'thunder'
+            # Try different API parameter combinations
+            param_sets = [
+                {"group": "sports", "active": "true", "closed": "false"},
+                {"tag": "MLB", "active": "true", "closed": "false"},
+                {"tag": "NBA", "active": "true", "closed": "false"},
+                {"tag": "NFL", "active": "true", "closed": "false"},
+                {"tag": "NHL", "active": "true", "closed": "false"},
+                {"active": "true", "closed": "false", "limit": 500}  # Get all and filter
             ]
             
-            nfl_teams = [
-                'cowboys', 'patriots', 'packers', 'chiefs', 'bills', 'eagles', 'rams',
-                'buccaneers', 'bucs', '49ers', 'niners', 'steelers', 'ravens', 'browns',
-                'bengals', 'seahawks', 'cardinals', 'saints', 'falcons', 'panthers',
-                'bears', 'lions', 'vikings', 'giants', 'jets', 'dolphins', 'colts',
-                'titans', 'jaguars', 'texans', 'broncos', 'raiders', 'chargers'
-            ]
+            seen_ids = set()
             
-            mlb_teams = [
-                'yankees', 'red sox', 'dodgers', 'giants', 'cubs', 'white sox', 'mets',
-                'phillies', 'braves', 'nationals', 'marlins', 'brewers', 'cardinals',
-                'pirates', 'reds', 'astros', 'rangers', 'athletics', 'mariners', 'angels',
-                'padres', 'rockies', 'diamondbacks', 'orioles', 'rays', 'blue jays',
-                'tigers', 'royals', 'twins', 'guardians', 'indians'
-            ]
-            
-            nhl_teams = [
-                'rangers', 'islanders', 'devils', 'flyers', 'penguins', 'capitals',
-                'hurricanes', 'panthers', 'lightning', 'bruins', 'sabres', 'canadiens',
-                'senators', 'maple leafs', 'red wings', 'blue jackets', 'blackhawks',
-                'wild', 'blues', 'predators', 'jets', 'stars', 'avalanche', 'coyotes',
-                'golden knights', 'sharks', 'ducks', 'kings', 'flames', 'oilers', 'canucks',
-                'kraken'
-            ]
-            
-            all_teams = nba_teams + nfl_teams + mlb_teams + nhl_teams
-            
-            # Exclude keywords
-            exclude_keywords = [
-                'championship', 'champion', 'finals', 'playoffs', 'mvp', 'award',
-                'season', 'division', 'conference', 'super bowl winner',
-                'world series winner', 'stanley cup winner', 'total', 'over/under',
-                'future', 'odds', 'prop', 'player', 'rookie', 'coach',
-                # Exclude celebrity/influencer fights
-                'ksi', 'logan', 'jake', 'paul', 'influencer', 'youtube',
-                'celebrity', 'exhibition', 'showdown'
-            ]
-            
-            # Fetch markets
-            url = f"{POLYMARKET_API_BASE}/events"
-            params = {
-                "active": "true",
-                "closed": "false",
-                "limit": 500
-            }
-            
-            async with self.session.get(url, params=params) as response:
-                if response.status == 200:
-                    data = await response.json()
+            for params in param_sets:
+                url = f"{POLYMARKET_API_BASE}/markets"  # Try /markets endpoint
+                
+                try:
+                    async with self.session.get(url, params=params) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            logger.info(f"API call with params {params} returned {len(data) if isinstance(data, list) else 'non-list'} items")
+                            
+                            if isinstance(data, list):
+                                for market in data:
+                                    market_id = market.get('id')
+                                    if market_id and market_id not in seen_ids:
+                                        seen_ids.add(market_id)
+                                        
+                                        title = market.get('question', market.get('title', '')).lower()
+                                        slug = market.get('slug', '').lower()
+                                        
+                                        # Log first few to see structure
+                                        if len(all_markets) < 3:
+                                            logger.info(f"Sample market: title='{title}', slug='{slug}'")
+                                        
+                                        # Look for sports games
+                                        is_sports = any(sport in title or sport in slug for sport in 
+                                                      ['mlb', 'nba', 'nfl', 'nhl', 'baseball', 'basketball', 
+                                                       'football', 'hockey', 'game', 'match', ' vs ', ' @ '])
+                                        
+                                        # Exclude futures
+                                        is_future = any(future in title for future in 
+                                                      ['championship', 'champion', 'season', 'mvp', 'winner',
+                                                       'playoffs', 'finals', 'award', 'draft'])
+                                        
+                                        if is_sports and not is_future:
+                                            # Categorize
+                                            if 'mlb' in title or 'baseball' in title:
+                                                market['category'] = 'MLB'
+                                            elif 'nba' in title or 'basketball' in title:
+                                                market['category'] = 'NBA'
+                                            elif 'nfl' in title or 'football' in title:
+                                                market['category'] = 'NFL'
+                                            elif 'nhl' in title or 'hockey' in title:
+                                                market['category'] = 'NHL'
+                                            else:
+                                                market['category'] = 'SPORTS'
+                                                
+                                            all_markets.append(market)
+                except Exception as e:
+                    logger.debug(f"API call failed with params {params}: {e}")
                     
-                    for event in data:
-                        title = event.get('title', '').lower()
+                await asyncio.sleep(0.5)
+            
+            # Also try the /events endpoint
+            try:
+                url = f"{POLYMARKET_API_BASE}/events"
+                params = {"active": "true", "closed": "false", "limit": 200}
+                
+                async with self.session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        logger.info(f"Events endpoint returned {len(data) if isinstance(data, list) else 'non-list'} items")
                         
-                        # Skip if contains exclude keywords
-                        if any(exclude in title for exclude in exclude_keywords):
-                            continue
-                            
-                        # Must have matchup format
-                        if not any(indicator in title for indicator in [' vs ', ' v ', ' @ ', ' at ']):
-                            continue
-                            
-                        # Count how many team names are in the title
-                        teams_found = sum(1 for team in all_teams if team in title)
-                        
-                        # Must have at least 2 team names (matchup)
-                        if teams_found >= 2:
-                            # Categorize by sport
-                            if any(team in title for team in nba_teams):
-                                category = 'NBA'
-                            elif any(team in title for team in nfl_teams):
-                                category = 'NFL'
-                            elif any(team in title for team in mlb_teams):
-                                category = 'MLB'
-                            elif any(team in title for team in nhl_teams):
-                                category = 'NHL'
-                            else:
-                                continue  # Skip if can't categorize
-                                
-                            event['category'] = category
-                            all_markets.append(event)
-                            logger.debug(f"Added {category} game: {event.get('title')}")
-                            
-            logger.info(f"Found {len(all_markets)} major league games")
+                        if isinstance(data, list):
+                            for event in data:
+                                # Events might have markets inside them
+                                markets = event.get('markets', [])
+                                if markets:
+                                    for market in markets:
+                                        market_id = market.get('id')
+                                        if market_id and market_id not in seen_ids:
+                                            seen_ids.add(market_id)
+                                            
+                                            title = market.get('question', market.get('title', '')).lower()
+                                            
+                                            # Same filtering logic
+                                            is_sports = any(sport in title for sport in 
+                                                          ['mlb', 'nba', 'nfl', 'nhl', 'game', ' vs ', ' @ '])
+                                            is_future = any(future in title for future in 
+                                                          ['championship', 'season', 'mvp', 'winner'])
+                                            
+                                            if is_sports and not is_future:
+                                                market['event_title'] = event.get('title', '')
+                                                market['category'] = 'SPORTS'
+                                                all_markets.append(market)
+            except Exception as e:
+                logger.debug(f"Events endpoint failed: {e}")
+            
+            logger.info(f"Found {len(all_markets)} sports game markets total")
+            
+            # If no markets found, log more details
+            if len(all_markets) == 0:
+                logger.warning("No sports markets found. Check API response structure.")
+                
             return all_markets
             
         except Exception as e:
