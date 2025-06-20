@@ -155,12 +155,35 @@ class PolymarketAPI:
                                                       ['mlb', 'nba', 'nfl', 'nhl', 'baseball', 'basketball', 
                                                        'football', 'hockey', 'game', 'match', ' vs ', ' @ '])
                                         
-                                        # Exclude futures
-                                        is_future = any(future in title for future in 
-                                                      ['championship', 'champion', 'season', 'mvp', 'winner',
-                                                       'playoffs', 'finals', 'award', 'draft'])
+                                        # STRICT exclusion for any futures/props
+                                        exclude_keywords = [
+                                            'championship', 'champion', 'season', 'mvp', 'winner',
+                                            'playoffs', 'finals', 'award', 'draft', 'super bowl',
+                                            'world series', 'stanley cup', 'title', 'tournament',
+                                            'conference', 'division', 'wildcard', 'all-star',
+                                            'rookie', 'coach', 'manager', 'total', 'over', 'under',
+                                            'prop', 'future', 'outright', 'series', 'sweep',
+                                            'win the', 'make the', 'reach the', 'clinch',
+                                            'player', 'team to', 'first to', 'last to',
+                                            'will win', 'to win', 'winning', 'finishes'
+                                        ]
                                         
-                                        if is_sports and not is_future:
+                                        # Must have game indicators
+                                        has_game_indicator = any(indicator in title for indicator in 
+                                                               [' vs ', ' v ', ' @ ', ' at ', 'game ', 'match ',
+                                                                'beat ', 'defeat ', 'tonight', 'today'])
+                                        
+                                        # Check for futures in title
+                                        has_excluded_word = any(exclude in title for exclude in exclude_keywords)
+                                        
+                                        if is_sports and has_game_indicator and not has_excluded_word:
+                                            # Additional check - should NOT have year in future
+                                            if '2025' in title or '2026' in title:
+                                                continue
+                                                
+                                            # Log what we're accepting
+                                            logger.info(f"Accepted game market: {title[:80]}")
+                                            
                                             # Categorize
                                             if 'mlb' in title or 'baseball' in title:
                                                 market['category'] = 'MLB'
@@ -311,99 +334,133 @@ class PolymarketScraper:
     def check_market_for_whales(self, market_url: str, target_wallets: Set[str]) -> List[Tuple[str, str, str]]:
         """Check if any target whales are in this market and which side they bet"""
         try:
-            logger.info(f"Checking market for known whales: {market_url}")
+            logger.info(f"Checking market for whales: {market_url}")
             self.driver.get(market_url)
             
             time.sleep(3)
             
-            # First, get the market question to understand what YES/NO means
-            market_question = None
+            # First check if we need to click "Game view" or similar
             try:
-                # Try different selectors for the market title/question
-                question_selectors = [
-                    "h1", 
-                    "[class*='market-title']",
-                    "[class*='question']",
-                    "[class*='header'] h1",
-                    ".c-market-header-title"
+                game_view_selectors = [
+                    "button:contains('Game view')",
+                    "a:contains('Game view')",
+                    "[class*='game-view']",
+                    "button:contains('View Game')",
+                    "a:contains('View Market')"
                 ]
                 
+                for selector in game_view_selectors:
+                    try:
+                        # Try CSS selector
+                        elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                        if not elements:
+                            # Try XPath for text content
+                            elements = self.driver.find_elements(By.XPATH, f"//*[contains(text(), 'Game view')]")
+                        
+                        if elements:
+                            logger.info("Found 'Game view' button, clicking...")
+                            elements[0].click()
+                            time.sleep(3)
+                            break
+                    except:
+                        continue
+            except Exception as e:
+                logger.debug(f"No game view button found: {e}")
+            
+            # Now look for holders/activity sections
+            found_whales = []
+            
+            # Try to find holders or activity tabs/sections
+            tab_selectors = [
+                "button:contains('Holders')",
+                "button:contains('Activity')",
+                "button:contains('Positions')",
+                "[role='tab']",
+                "[class*='tab']"
+            ]
+            
+            for selector in tab_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    if not elements:
+                        elements = self.driver.find_elements(By.XPATH, f"//*[contains(text(), 'Holders') or contains(text(), 'Activity')]")
+                    
+                    for element in elements:
+                        text = element.text
+                        if 'holders' in text.lower() or 'activity' in text.lower():
+                            logger.info(f"Found {text} tab, clicking...")
+                            element.click()
+                            time.sleep(2)
+                            break
+                except:
+                    continue
+            
+            # Get the market question
+            market_question = None
+            try:
+                question_selectors = ["h1", "[class*='title']", "[class*='question']"]
                 for selector in question_selectors:
                     elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
                     if elements and elements[0].text:
                         market_question = elements[0].text
-                        logger.info(f"Market question: {market_question}")
                         break
-            except Exception as e:
-                logger.debug(f"Could not find market question: {e}")
+            except:
+                pass
             
-            found_whales = []
+            # Now look for profile links in holders/activity section
+            profile_links = self.driver.find_elements(By.CSS_SELECTOR, "a[href*='/profile/']")
             
-            # Look for YES and NO outcome sections
-            try:
-                # Find outcome cards/sections
-                outcome_selectors = [
-                    "[class*='outcome']",
-                    "[class*='position-card']",
-                    "[class*='market-card']",
-                    ".c-outcome"
-                ]
-                
-                for selector in outcome_selectors:
-                    outcome_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                    
-                    for outcome in outcome_elements:
-                        outcome_text = outcome.text
-                        
-                        # Determine if this is YES or NO section
-                        is_yes_section = 'yes' in outcome_text.lower() and 'no' not in outcome_text.lower()
-                        is_no_section = 'no' in outcome_text.lower() and 'yes' not in outcome_text.lower()
-                        
-                        if not (is_yes_section or is_no_section):
-                            continue
-                            
-                        side = 'YES' if is_yes_section else 'NO'
-                        
-                        # Now look for wallet addresses in this section
-                        links = outcome.find_elements(By.TAG_NAME, "a")
-                        for link in links:
-                            href = link.get_attribute('href')
-                            if href and '/profile/0x' in href:
-                                wallet = href.split('/profile/')[-1].split('?')[0].lower()
-                                if wallet in target_wallets:
-                                    found_whales.append((wallet, side, market_question))
-                                    logger.info(f"Found whale {wallet[:8]}... betting {side}")
-            except Exception as e:
-                logger.debug(f"Error parsing outcomes: {e}")
+            if not profile_links:
+                # Try alternate selectors
+                profile_links = self.driver.find_elements(By.XPATH, "//a[contains(@href, '/profile/')]")
             
-            # Fallback: check all profile links if we didn't find them in outcome sections
-            if not found_whales:
-                links = self.driver.find_elements(By.TAG_NAME, "a")
-                for link in links:
+            logger.info(f"Found {len(profile_links)} profile links on page")
+            
+            # If still no whales but we're not tracking any yet, get top holders
+            if not target_wallets and len(profile_links) > 0:
+                logger.info("No target wallets yet, will check top holders")
+                # Get first 10 profile links as potential whales
+                for link in profile_links[:10]:
+                    href = link.get_attribute('href')
+                    if href and '/profile/0x' in href:
+                        wallet = href.split('/profile/')[-1].split('?')[0].lower()
+                        if wallet.startswith('0x') and len(wallet) == 42:
+                            # Try to determine YES/NO from context
+                            side = 'UNKNOWN'
+                            try:
+                                parent = link.find_element(By.XPATH, "../..")
+                                parent_text = parent.text
+                                if 'YES' in parent_text:
+                                    side = 'YES'
+                                elif 'NO' in parent_text:
+                                    side = 'NO'
+                            except:
+                                pass
+                            found_whales.append((wallet, side, market_question))
+            else:
+                # Check if any known whales are here
+                for link in profile_links:
                     href = link.get_attribute('href')
                     if href and '/profile/0x' in href:
                         wallet = href.split('/profile/')[-1].split('?')[0].lower()
                         if wallet in target_wallets:
-                            # Try to find YES/NO context
+                            # Try to determine YES/NO
+                            side = 'UNKNOWN'
                             try:
-                                # Check parent elements for YES/NO text
-                                parent = link
-                                for _ in range(3):  # Check up to 3 levels up
-                                    parent = parent.find_element(By.XPATH, "./..")
-                                    parent_text = parent.text
-                                    if 'YES' in parent_text and 'NO' not in parent_text:
-                                        found_whales.append((wallet, 'YES', market_question))
-                                        break
-                                    elif 'NO' in parent_text and 'YES' not in parent_text:
-                                        found_whales.append((wallet, 'NO', market_question))
-                                        break
-                                else:
-                                    found_whales.append((wallet, 'UNKNOWN', market_question))
+                                parent = link.find_element(By.XPATH, "../..")
+                                parent_text = parent.text
+                                if 'YES' in parent_text:
+                                    side = 'YES'
+                                elif 'NO' in parent_text:
+                                    side = 'NO'
                             except:
-                                found_whales.append((wallet, 'UNKNOWN', market_question))
-                        
+                                pass
+                            found_whales.append((wallet, side, market_question))
+            
             if found_whales:
-                logger.info(f"Found {len(found_whales)} known whales in this market")
+                logger.info(f"Found {len(found_whales)} whales in market")
+            else:
+                logger.info("No whales found in this market")
                 
             return found_whales
             
