@@ -1,8 +1,8 @@
 """
-Polymarket Sharp Bettor Tracker Bot - Updated Version
+Polymarket Sharp Bettor Tracker Bot - Focused Version
 
 This bot tracks profitable bettors on Polymarket and alerts when they make new bets.
-Updated to use the simpler profile scraping approach discovered in testing.
+Optimized to focus on known whales and sports markets only.
 """
 
 import asyncio
@@ -11,6 +11,7 @@ import logging
 import os
 import time
 import re
+import gc
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, asdict
@@ -48,6 +49,12 @@ MIN_ROI_SHARP = float(os.getenv('MIN_ROI_SHARP', '10'))
 MIN_VOLUME_SHARP = float(os.getenv('MIN_VOLUME_SHARP', '50000'))
 MIN_BET_ALERT = float(os.getenv('MIN_BET_ALERT', '5000'))
 
+# Scanning configuration
+SCAN_LEADERBOARD = os.getenv('SCAN_LEADERBOARD', 'true').lower() == 'true'
+SCAN_KNOWN_WHALES_ONLY = os.getenv('SCAN_KNOWN_WHALES_ONLY', 'false').lower() == 'true'
+BATCH_SIZE = int(os.getenv('BATCH_SIZE', '10'))
+MAX_NEW_WALLETS_PER_SCAN = int(os.getenv('MAX_NEW_WALLETS_PER_SCAN', '10'))
+
 @dataclass
 class BettorProfile:
     """Data class for bettor profile information"""
@@ -59,15 +66,7 @@ class BettorProfile:
     positions_value: float
     roi: float
     last_updated: datetime
-    
-@dataclass
-class MarketPosition:
-    """Data class for a position in a market"""
-    wallet_address: str
-    market_url: str
-    market_title: str
-    position_size: float
-    timestamp: datetime
+    leaderboard_rank: Optional[int] = None
 
 class PolymarketAPI:
     """Handles all Polymarket API interactions"""
@@ -84,41 +83,69 @@ class PolymarketAPI:
             await self.session.close()
             
     async def get_sports_markets(self) -> List[Dict]:
-        """Fetch all active sports markets"""
+        """Fetch only sports markets with proper filtering"""
         try:
             all_markets = []
-            sports_groups = ['MLB', 'NFL', 'NBA', 'NHL', 'NCAAB', 'NCAAF']
             
-            for sport in sports_groups:
-                url = f"{POLYMARKET_API_BASE}/events"
-                params = {
-                    "group": sport,
-                    "active": "true",
-                    "closed": "false",
-                    "limit": 50
-                }
-                
-                async with self.session.get(url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        for event in data:
-                            event['sport'] = sport
-                            all_markets.append(event)
-                    else:
-                        logger.error(f"Failed to fetch {sport} markets: {response.status}")
+            # Define sports and their keywords
+            sports_config = {
+                'NFL': ['nfl', 'football', 'touchdown', 'quarterback', 'super bowl'],
+                'NBA': ['nba', 'basketball', 'points', 'rebounds', 'lakers', 'celtics'],
+                'MLB': ['mlb', 'baseball', 'home run', 'pitcher', 'world series'],
+                'NHL': ['nhl', 'hockey', 'goal', 'stanley cup'],
+                'SOCCER': ['soccer', 'football', 'goal', 'premier league', 'champions league'],
+                'UFC': ['ufc', 'mma', 'fight', 'knockout'],
+                'BOXING': ['boxing', 'fight', 'knockout', 'round']
+            }
+            
+            # Fetch markets
+            url = f"{POLYMARKET_API_BASE}/events"
+            params = {
+                "active": "true",
+                "closed": "false",
+                "limit": 500  # Get more to filter
+            }
+            
+            async with self.session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    for event in data:
+                        title = event.get('title', '').lower()
+                        description = event.get('description', '').lower()
+                        slug = event.get('slug', '').lower()
                         
-                # Rate limiting
-                await asyncio.sleep(1)
-                
-            logger.info(f"Found {len(all_markets)} total sports markets")
-            return all_markets
+                        # Check if it's a sports market
+                        for sport, keywords in sports_config.items():
+                            if any(keyword in title or keyword in description or keyword in slug 
+                                  for keyword in keywords):
+                                # Additional filtering - must contain game/match indicators
+                                game_indicators = ['vs', 'versus', 'beat', 'win', 'game', 'match', 
+                                                 'championship', 'league', 'season', 'score']
+                                if any(indicator in title for indicator in game_indicators):
+                                    event['category'] = sport
+                                    all_markets.append(event)
+                                    break
+                                    
+            # Filter out non-sports that slipped through
+            filtered_markets = []
+            exclude_keywords = ['politics', 'election', 'president', 'congress', 'senate', 
+                              'crypto', 'bitcoin', 'ethereum', 'stock', 'economy']
+            
+            for market in all_markets:
+                title = market.get('title', '').lower()
+                if not any(keyword in title for keyword in exclude_keywords):
+                    filtered_markets.append(market)
+                    
+            logger.info(f"Found {len(filtered_markets)} sports markets after filtering")
+            return filtered_markets
             
         except Exception as e:
             logger.error(f"Error fetching sports markets: {e}")
             return []
 
 class PolymarketScraper:
-    """Handles web scraping for whale detection and P&L data"""
+    """Handles web scraping with focus on known whales"""
     
     def __init__(self, headless: bool = True):
         self.headless = headless
@@ -134,58 +161,140 @@ class PolymarketScraper:
         options.add_argument('--window-size=1920,1080')
         options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
         
-        # Use webdriver_manager for automatic driver management
+        # Memory optimization
+        options.add_argument('--memory-pressure-off')
+        options.add_argument('--disable-background-timer-throttling')
+        options.add_argument('--disable-features=TranslateUI')
+        
+        # Disable images to save memory
+        prefs = {'profile.managed_default_content_settings.images': 2}
+        options.add_experimental_option('prefs', prefs)
+        
         try:
             from webdriver_manager.chrome import ChromeDriverManager
             from selenium.webdriver.chrome.service import Service
             service = Service(ChromeDriverManager().install())
             self.driver = webdriver.Chrome(service=service, options=options)
         except:
-            # Fallback to regular Chrome
             self.driver = webdriver.Chrome(options=options)
             
+        self.driver.set_page_load_timeout(30)
         return self
         
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.driver:
-            self.driver.quit()
-            
-    def get_market_whales(self, market_url: str) -> List[str]:
-        """Get whale wallet addresses from a market page"""
+            try:
+                self.driver.quit()
+            except:
+                pass
+                
+    def get_leaderboard_whales(self) -> List[Tuple[str, int]]:
+        """Scrape top traders from Polymarket leaderboard"""
         try:
-            logger.info(f"Scanning market: {market_url}")
+            logger.info("Scanning Polymarket leaderboard for top traders...")
+            self.driver.get(f"{POLYMARKET_BASE_URL}/leaderboard")
+            
+            time.sleep(3)  # Wait for page to load
+            
+            whale_wallets = []
+            
+            # Look for leaderboard entries
+            # Try different possible selectors
+            selectors = [
+                "a[href*='/profile/0x']",
+                ".leaderboard-row a",
+                "[class*='leaderboard'] a",
+                "table a[href*='profile']"
+            ]
+            
+            for selector in selectors:
+                links = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if links:
+                    logger.info(f"Found {len(links)} potential whale links with selector: {selector}")
+                    for i, link in enumerate(links[:50], 1):  # Top 50 traders
+                        href = link.get_attribute('href')
+                        if href and '/profile/0x' in href:
+                            wallet = href.split('/profile/')[-1].split('?')[0].lower()
+                            if wallet.startswith('0x') and len(wallet) == 42:
+                                whale_wallets.append((wallet, i))  # wallet, rank
+                    break
+                    
+            logger.info(f"Found {len(whale_wallets)} whales from leaderboard")
+            return whale_wallets
+            
+        except Exception as e:
+            logger.error(f"Error scraping leaderboard: {e}")
+            return []
+            
+    def check_market_for_whales(self, market_url: str, target_wallets: Set[str]) -> List[str]:
+        """Check if any target whales are in this market"""
+        try:
+            logger.info(f"Checking market for known whales: {market_url}")
             self.driver.get(market_url)
             
-            # Wait for page to load
-            time.sleep(3)
+            time.sleep(2)
             
-            # Find all profile links on the page
-            whale_wallets = set()
+            found_whales = []
             links = self.driver.find_elements(By.TAG_NAME, "a")
             
             for link in links:
                 href = link.get_attribute('href')
                 if href and '/profile/0x' in href:
-                    # Extract wallet address
                     wallet = href.split('/profile/')[-1].split('?')[0].lower()
-                    if wallet.startswith('0x') and len(wallet) == 42:
-                        whale_wallets.add(wallet)
+                    if wallet in target_wallets:
+                        found_whales.append(wallet)
                         
-            logger.info(f"Found {len(whale_wallets)} unique wallets on {market_url}")
-            return list(whale_wallets)
+            if found_whales:
+                logger.info(f"Found {len(found_whales)} known whales in this market")
+                
+            return found_whales
             
         except Exception as e:
-            logger.error(f"Error scraping market whales: {e}")
+            logger.error(f"Error checking market for whales: {e}")
             return []
             
-    def get_user_profile_data(self, wallet_address: str) -> Optional[BettorProfile]:
+    def get_market_top_holders(self, market_url: str, limit: int = 5) -> List[str]:
+        """Get only the top holders from a market"""
+        try:
+            self.driver.get(market_url)
+            time.sleep(2)
+            
+            # Look for holder/position sections
+            # These are usually the biggest positions
+            top_wallets = []
+            
+            # Try to find a positions or holders table/list
+            position_selectors = [
+                ".positions-list a[href*='profile']",
+                ".top-holders a[href*='profile']",
+                "[class*='position'] a[href*='profile']",
+                "a[href*='profile/0x']"  # Fallback
+            ]
+            
+            for selector in position_selectors:
+                links = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if links:
+                    for link in links[:limit]:  # Only top N
+                        href = link.get_attribute('href')
+                        if href and '/profile/0x' in href:
+                            wallet = href.split('/profile/')[-1].split('?')[0].lower()
+                            if wallet.startswith('0x') and len(wallet) == 42:
+                                top_wallets.append(wallet)
+                    break
+                    
+            return top_wallets
+            
+        except Exception as e:
+            logger.error(f"Error getting top holders: {e}")
+            return []
+            
+    def get_user_profile_data(self, wallet_address: str, rank: Optional[int] = None) -> Optional[BettorProfile]:
         """Scrape user profile to get P&L data"""
         try:
             url = f"{POLYMARKET_BASE_URL}/profile/{wallet_address}"
             self.driver.get(url)
             
-            # Wait for profile to load
-            time.sleep(3)
+            time.sleep(2)
             
             # Extract all text
             page_text = self.driver.find_element(By.TAG_NAME, "body").text
@@ -203,11 +312,10 @@ class PolymarketScraper:
                 elif 'Positions value' in line and i+1 < len(lines):
                     data['positions'] = lines[i+1]
                     
-            # Get username if available
+            # Get username
             username = None
             for i, line in enumerate(lines):
                 if wallet_address[:6].lower() in line.lower():
-                    # Username is usually right before the wallet snippet
                     if i > 0:
                         potential_username = lines[i-1]
                         if not any(x in potential_username.lower() for x in ['joined', 'positions', 'profit', 'volume']):
@@ -216,13 +324,10 @@ class PolymarketScraper:
                     
             # Parse numeric values
             def parse_money(value_str):
-                """Parse money string to float"""
                 if not value_str:
                     return 0.0
-                # Remove $ and commas, handle negative values
                 clean = value_str.replace('$', '').replace(',', '')
                 if '(' in clean and ')' in clean:
-                    # Handle format like ($1,234.56) for negative
                     clean = '-' + clean.replace('(', '').replace(')', '')
                 try:
                     return float(clean)
@@ -253,43 +358,15 @@ class PolymarketScraper:
                 markets_traded=markets_traded,
                 positions_value=positions_value,
                 roi=roi,
-                last_updated=datetime.utcnow()
+                last_updated=datetime.utcnow(),
+                leaderboard_rank=rank
             )
             
         except Exception as e:
             logger.error(f"Error scraping user profile {wallet_address}: {e}")
             return None
-            
-    def check_user_positions(self, wallet_address: str) -> List[Dict]:
-        """Check current positions for a user"""
-        try:
-            url = f"{POLYMARKET_BASE_URL}/profile/{wallet_address}"
-            self.driver.get(url)
-            time.sleep(3)
-            
-            # Look for position information on the profile
-            positions = []
-            
-            # Find elements that might contain position data
-            # This is simplified - you might need to adjust based on actual HTML structure
-            position_elements = self.driver.find_elements(By.CSS_SELECTOR, "[class*='position']")
-            
-            for elem in position_elements:
-                try:
-                    text = elem.text
-                    if '$' in text and any(word in text.lower() for word in ['yes', 'no', 'shares']):
-                        positions.append({
-                            'text': text,
-                            'timestamp': datetime.utcnow()
-                        })
-                except:
-                    continue
-                    
-            return positions
-            
-        except Exception as e:
-            logger.error(f"Error checking positions: {e}")
-            return []
+        finally:
+            gc.collect()
 
 class DatabaseManager:
     """Manages SQLite database for storing bettor and position data"""
@@ -303,7 +380,7 @@ class DatabaseManager:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             
-            # Bettors table
+            # Bettors table with leaderboard rank
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS bettors (
                     wallet_address TEXT PRIMARY KEY,
@@ -314,39 +391,39 @@ class DatabaseManager:
                     positions_value REAL,
                     roi REAL,
                     last_updated TIMESTAMP,
-                    is_sharp BOOLEAN DEFAULT 0
+                    is_sharp BOOLEAN DEFAULT 0,
+                    leaderboard_rank INTEGER,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
-            # Positions table (tracks whale positions over time)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS positions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    wallet_address TEXT,
-                    market_url TEXT,
-                    market_title TEXT,
-                    position_size REAL,
-                    timestamp TIMESTAMP,
-                    alert_sent BOOLEAN DEFAULT 0,
-                    FOREIGN KEY (wallet_address) REFERENCES bettors (wallet_address)
-                )
-            """)
-            
-            # Whale sightings table (tracks which whales are in which markets)
+            # Whale sightings table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS whale_sightings (
                     wallet_address TEXT,
                     market_url TEXT,
+                    market_category TEXT,
                     first_seen TIMESTAMP,
                     last_seen TIMESTAMP,
                     PRIMARY KEY (wallet_address, market_url)
                 )
             """)
             
+            # Alerts sent table to avoid duplicates
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS alerts_sent (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    wallet_address TEXT,
+                    market_url TEXT,
+                    alert_timestamp TIMESTAMP,
+                    UNIQUE(wallet_address, market_url)
+                )
+            """)
+            
             # Create indexes
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_timestamp ON positions(timestamp)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_wallet ON positions(wallet_address)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_bettors_sharp ON bettors(is_sharp)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_bettors_pnl ON bettors(total_pnl DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sightings_first_seen ON whale_sightings(first_seen)")
             
             conn.commit()
             
@@ -365,38 +442,60 @@ class DatabaseManager:
             cursor.execute("""
                 INSERT OR REPLACE INTO bettors 
                 (wallet_address, username, total_pnl, total_volume, markets_traded, 
-                 positions_value, roi, last_updated, is_sharp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 positions_value, roi, last_updated, is_sharp, leaderboard_rank)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 bettor.wallet_address, bettor.username, bettor.total_pnl,
                 bettor.total_volume, bettor.markets_traded, bettor.positions_value,
-                bettor.roi, bettor.last_updated, is_sharp
+                bettor.roi, bettor.last_updated, is_sharp, bettor.leaderboard_rank
             ))
             
             conn.commit()
             
             if is_sharp:
-                logger.info(f"Sharp bettor identified: {bettor.wallet_address} - P&L: ${bettor.total_pnl:,.0f}, ROI: {bettor.roi:.1f}%")
+                logger.info(f"💎 Sharp bettor: {bettor.wallet_address} - P&L: ${bettor.total_pnl:,.0f}, ROI: {bettor.roi:.1f}%")
                 
-    def record_whale_sighting(self, wallet_address: str, market_url: str):
+    def get_known_sharp_wallets(self) -> Set[str]:
+        """Get set of known sharp bettor wallets"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT wallet_address FROM bettors 
+                WHERE is_sharp = 1
+            """)
+            return set(row[0] for row in cursor.fetchall())
+            
+    def get_all_tracked_wallets(self) -> Set[str]:
+        """Get all wallets we're tracking (sharp or potential)"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT wallet_address FROM bettors 
+                WHERE total_volume > 10000  -- Active traders
+                OR leaderboard_rank IS NOT NULL  -- Leaderboard traders
+                OR is_sharp = 1  -- Known sharps
+            """)
+            return set(row[0] for row in cursor.fetchall())
+            
+    def record_whale_sighting(self, wallet_address: str, market_url: str, category: str):
         """Record that a whale was seen in a market"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             
             cursor.execute("""
                 INSERT OR REPLACE INTO whale_sightings 
-                (wallet_address, market_url, first_seen, last_seen)
+                (wallet_address, market_url, market_category, first_seen, last_seen)
                 VALUES (
-                    ?, ?, 
+                    ?, ?, ?,
                     COALESCE((SELECT first_seen FROM whale_sightings WHERE wallet_address = ? AND market_url = ?), ?),
                     ?
                 )
-            """, (wallet_address, market_url, wallet_address, market_url, datetime.utcnow(), datetime.utcnow()))
+            """, (wallet_address, market_url, category, wallet_address, market_url, datetime.utcnow(), datetime.utcnow()))
             
             conn.commit()
             
     def get_new_sharp_positions(self, hours: int = 1) -> List[Dict]:
-        """Get new positions from sharp bettors in the last N hours"""
+        """Get new positions from sharp bettors"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             
@@ -406,16 +505,23 @@ class DatabaseManager:
                 SELECT DISTINCT
                     ws.wallet_address,
                     ws.market_url,
+                    ws.market_category,
                     b.username,
                     b.total_pnl,
                     b.roi,
                     b.positions_value,
-                    ws.first_seen
+                    ws.first_seen,
+                    b.leaderboard_rank
                 FROM whale_sightings ws
                 JOIN bettors b ON ws.wallet_address = b.wallet_address
                 WHERE b.is_sharp = 1
                 AND ws.first_seen > ?
                 AND b.positions_value >= ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM alerts_sent a 
+                    WHERE a.wallet_address = ws.wallet_address 
+                    AND a.market_url = ws.market_url
+                )
                 ORDER BY ws.first_seen DESC
             """, (cutoff_time, MIN_BET_ALERT))
             
@@ -424,14 +530,27 @@ class DatabaseManager:
                 results.append({
                     'wallet_address': row[0],
                     'market_url': row[1],
-                    'username': row[2],
-                    'total_pnl': row[3],
-                    'roi': row[4],
-                    'positions_value': row[5],
-                    'timestamp': row[6]
+                    'market_category': row[2],
+                    'username': row[3],
+                    'total_pnl': row[4],
+                    'roi': row[5],
+                    'positions_value': row[6],
+                    'timestamp': row[7],
+                    'leaderboard_rank': row[8]
                 })
                 
             return results
+            
+    def mark_alert_sent(self, wallet_address: str, market_url: str):
+        """Mark that an alert was sent for this position"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR IGNORE INTO alerts_sent 
+                (wallet_address, market_url, alert_timestamp)
+                VALUES (?, ?, ?)
+            """, (wallet_address, market_url, datetime.utcnow()))
+            conn.commit()
             
     def get_sharp_bettors(self) -> List[BettorProfile]:
         """Get all sharp bettors from database"""
@@ -457,7 +576,8 @@ class DatabaseManager:
                     markets_traded=row[4],
                     positions_value=row[5],
                     roi=row[6],
-                    last_updated=datetime.fromisoformat(row[7])
+                    last_updated=datetime.fromisoformat(row[7]),
+                    leaderboard_rank=row[9] if len(row) > 9 else None
                 ))
                 
             return bettors
@@ -491,25 +611,29 @@ class TwitterBot:
     def post_alert(self, position_data: Dict) -> bool:
         """Post a whale alert to Twitter"""
         try:
-            # Format the alert message
             username = position_data.get('username', 'Whale')
             wallet_short = f"{position_data['wallet_address'][:6]}...{position_data['wallet_address'][-4:]}"
             
             # Extract market title from URL
             market_slug = position_data['market_url'].split('/')[-1]
-            market_title = market_slug.replace('-', ' ').title()
+            market_title = market_slug.replace('-', ' ').title()[:50]
+            
+            category = position_data.get('market_category', 'SPORTS')
+            rank = position_data.get('leaderboard_rank')
+            
+            rank_text = f"🏅 Rank #{rank} " if rank else ""
             
             message = f"""🐋 SHARP BETTOR ALERT
 
 {username} ({wallet_short})
-💰 Lifetime P&L: +${position_data['total_pnl']:,.0f}
+{rank_text}💰 P&L: +${position_data['total_pnl']:,.0f}
 📊 ROI: {position_data['roi']:.1f}%
 
-New position detected:
+New {category} position:
 📍 {market_title}
-💵 Position Value: ${position_data['positions_value']:,.0f}
+💵 Value: ${position_data['positions_value']:,.0f}
 
-#Polymarket #SharpMoney #SportsBetting"""
+#Polymarket #SharpMoney #{category}"""
 
             if TWITTER_ENABLED:
                 self.api.update_status(message)
@@ -526,14 +650,15 @@ New position detected:
     def post_leaderboard(self, bettors: List[BettorProfile]) -> bool:
         """Post daily leaderboard"""
         try:
-            message = "🏆 TOP SHARP BETTORS ON POLYMARKET\n\n"
+            message = "🏆 TOP SHARP SPORTS BETTORS\n\n"
             
             for i, bettor in enumerate(bettors[:10], 1):
                 username = bettor.username or f"{bettor.wallet_address[:8]}..."
-                message += f"{i}. {username}\n"
-                message += f"   💰 P&L: +${bettor.total_pnl:,.0f} ({bettor.roi:.1f}% ROI)\n"
+                rank_emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                message += f"{rank_emoji} {username}\n"
+                message += f"   💰 +${bettor.total_pnl:,.0f} ({bettor.roi:.1f}% ROI)\n"
                 
-            message += "\n#Polymarket #SharpMoney"
+            message += "\n#Polymarket #SportsBetting"
             
             if TWITTER_ENABLED:
                 self.api.update_status(message)
@@ -548,7 +673,7 @@ New position detected:
             return False
 
 class PolymarketTracker:
-    """Main tracker class that coordinates all components"""
+    """Main tracker class focused on known whales"""
     
     def __init__(self, twitter_credentials: Optional[Dict] = None):
         self.db = DatabaseManager()
@@ -564,46 +689,102 @@ class PolymarketTracker:
         else:
             logger.warning("Twitter credentials not provided or incomplete")
             
-    async def scan_markets(self):
-        """Scan sports markets for whale activity"""
-        logger.info("Starting market scan...")
+    async def scan_leaderboard(self):
+        """Scan leaderboard for new whales"""
+        if not SCAN_LEADERBOARD:
+            return
+            
+        logger.info("📊 Scanning leaderboard for top traders...")
         
-        # Get active sports markets from API
+        with PolymarketScraper(headless=True) as scraper:
+            # Get top traders from leaderboard
+            leaderboard_whales = scraper.get_leaderboard_whales()
+            
+            if not leaderboard_whales:
+                logger.warning("No whales found on leaderboard")
+                return
+                
+            # Check profiles of new whales
+            new_whales_checked = 0
+            for wallet, rank in leaderboard_whales:
+                if self.db.needs_update(wallet) and new_whales_checked < MAX_NEW_WALLETS_PER_SCAN:
+                    profile = scraper.get_user_profile_data(wallet, rank)
+                    if profile:
+                        self.db.update_bettor(profile)
+                        new_whales_checked += 1
+                        time.sleep(1)  # Rate limiting
+                        
+            logger.info(f"✅ Updated {new_whales_checked} whale profiles from leaderboard")
+            
+    async def scan_sports_markets(self):
+        """Scan sports markets for whale activity"""
+        logger.info("🏈 Starting sports market scan...")
+        
+        # Get sports markets only
         async with PolymarketAPI() as api:
             markets = await api.get_sports_markets()
             
         if not markets:
-            logger.warning("No markets found")
+            logger.warning("No sports markets found")
             return
             
-        # Process markets with web scraping
-        with PolymarketScraper(headless=True) as scraper:
-            for market in markets:
-                try:
-                    market_url = f"{POLYMARKET_BASE_URL}/event/{market.get('slug', '')}"
-                    
-                    # Get whales from this market
-                    whale_wallets = scraper.get_market_whales(market_url)
-                    
-                    # Process each whale
-                    for wallet in whale_wallets:
-                        # Record the sighting
-                        self.db.record_whale_sighting(wallet, market_url)
+        # Get known whales to track
+        if SCAN_KNOWN_WHALES_ONLY:
+            target_wallets = self.db.get_known_sharp_wallets()
+            logger.info(f"🎯 Tracking {len(target_wallets)} known sharp bettors")
+        else:
+            target_wallets = self.db.get_all_tracked_wallets()
+            logger.info(f"🎯 Tracking {len(target_wallets)} known wallets")
+            
+        if not target_wallets:
+            logger.warning("No known whales to track. Run with SCAN_LEADERBOARD=true first")
+            return
+            
+        # Process markets in batches
+        whales_found = 0
+        markets_checked = 0
+        
+        for batch_start in range(0, len(markets), BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, len(markets))
+            batch = markets[batch_start:batch_end]
+            
+            logger.info(f"📦 Processing batch: markets {batch_start+1}-{batch_end}")
+            
+            with PolymarketScraper(headless=True) as scraper:
+                for market in batch:
+                    try:
+                        market_url = f"{POLYMARKET_BASE_URL}/event/{market.get('slug', '')}"
+                        category = market.get('category', 'SPORTS')
                         
-                        # Check if we need to update their profile
-                        if self.db.needs_update(wallet):
-                            profile = scraper.get_user_profile_data(wallet)
-                            if profile:
-                                self.db.update_bettor(profile)
+                        # Check if any known whales are in this market
+                        found_whales = scraper.check_market_for_whales(market_url, target_wallets)
+                        
+                        if found_whales:
+                            logger.info(f"🎯 Found {len(found_whales)} whales in {market.get('title', 'Unknown')}")
+                            whales_found += len(found_whales)
+                            
+                            for wallet in found_whales:
+                                self.db.record_whale_sighting(wallet, market_url, category)
                                 
-                    # Rate limiting between markets
-                    time.sleep(2)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing market {market.get('slug', 'unknown')}: {e}")
-                    continue
-                    
-        logger.info("Market scan completed")
+                        # Optionally check top holders if not enough whales found
+                        elif not SCAN_KNOWN_WHALES_ONLY and markets_checked < 20:
+                            top_holders = scraper.get_market_top_holders(market_url, limit=3)
+                            for wallet in top_holders:
+                                if wallet not in target_wallets and self.db.needs_update(wallet):
+                                    profile = scraper.get_user_profile_data(wallet)
+                                    if profile and profile.total_pnl > 5000:  # Potential whale
+                                        self.db.update_bettor(profile)
+                                        
+                        markets_checked += 1
+                        time.sleep(0.5)  # Rate limiting
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing market: {e}")
+                        continue
+                        
+            gc.collect()  # Clean up between batches
+            
+        logger.info(f"✅ Scan complete: Checked {markets_checked} markets, found {whales_found} whale positions")
         
     def check_for_alerts(self):
         """Check for new sharp bettor positions and send alerts"""
@@ -612,17 +793,17 @@ class PolymarketTracker:
             return
             
         # Get new positions from sharp bettors
-        new_positions = self.db.get_new_sharp_positions(hours=1)
+        new_positions = self.db.get_new_sharp_positions(hours=2)
         
         for position in new_positions:
-            logger.info(f"New sharp position detected: {position['wallet_address']} in {position['market_url']}")
+            logger.info(f"🚨 New sharp position: {position['wallet_address']} in {position['market_category']}")
             
             # Send alert
             if self.twitter_bot.post_alert(position):
-                logger.info("Alert posted successfully")
+                # Mark as alerted to avoid duplicates
+                self.db.mark_alert_sent(position['wallet_address'], position['market_url'])
                 
-            # Rate limit Twitter posts
-            time.sleep(5)
+            time.sleep(5)  # Rate limit Twitter posts
             
     def post_daily_leaderboard(self):
         """Post daily leaderboard of top sharp bettors"""
@@ -636,22 +817,31 @@ class PolymarketTracker:
     async def run_cycle(self):
         """Run a complete scan and alert cycle"""
         try:
-            logger.info("Starting tracker cycle...")
+            logger.info("🔄 Starting tracker cycle...")
             
-            # Scan markets for whales
-            await self.scan_markets()
+            # Scan leaderboard for new whales
+            await self.scan_leaderboard()
+            
+            # Scan sports markets for whale activity
+            await self.scan_sports_markets()
             
             # Check for alerts
             self.check_for_alerts()
             
-            logger.info("Tracker cycle completed")
+            logger.info("✅ Tracker cycle completed")
+            
+            # Log stats
+            sharp_wallets = self.db.get_known_sharp_wallets()
+            logger.info(f"📊 Stats: Tracking {len(sharp_wallets)} sharp bettors")
+            
+            gc.collect()
             
         except Exception as e:
             logger.error(f"Error in tracker cycle: {e}")
 
 def main():
     """Main entry point"""
-    # Load configuration from environment variables
+    # Load configuration
     twitter_creds = {
         'api_key': os.getenv('TWITTER_API_KEY'),
         'api_secret': os.getenv('TWITTER_API_SECRET'),
@@ -662,8 +852,17 @@ def main():
     # Initialize tracker
     tracker = PolymarketTracker(twitter_creds)
     
+    # Log configuration
+    logger.info("🚀 Polymarket Sharp Bettor Tracker Starting...")
+    logger.info(f"📋 Configuration:")
+    logger.info(f"   - Scan leaderboard: {SCAN_LEADERBOARD}")
+    logger.info(f"   - Known whales only: {SCAN_KNOWN_WHALES_ONLY}")
+    logger.info(f"   - Twitter enabled: {TWITTER_ENABLED}")
+    logger.info(f"   - Min P&L for sharp: ${MIN_PNL_SHARP:,.0f}")
+    logger.info(f"   - Min ROI for sharp: {MIN_ROI_SHARP}%")
+    
     # Run initial scan
-    logger.info("Running initial scan...")
+    logger.info("🏃 Running initial scan...")
     asyncio.run(tracker.run_cycle())
     
     # Schedule regular scans
@@ -672,7 +871,7 @@ def main():
     # Schedule daily leaderboard
     schedule.every().day.at("12:00").do(tracker.post_daily_leaderboard)
     
-    logger.info("Polymarket tracker started. Running scans every 30 minutes...")
+    logger.info("⏰ Scheduled scans every 30 minutes...")
     
     # Keep running
     while True:
