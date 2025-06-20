@@ -628,6 +628,35 @@ class DatabaseManager:
                 
             last_updated = datetime.fromisoformat(result[0])
             return datetime.utcnow() - last_updated > timedelta(hours=hours)
+            
+    def get_scanning_stats(self) -> Dict:
+        """Get statistics about scanning progress"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            stats = {}
+            
+            # Total bettors
+            cursor.execute("SELECT COUNT(*) FROM bettors")
+            stats['total_bettors'] = cursor.fetchone()[0]
+            
+            # Sharp bettors
+            cursor.execute("SELECT COUNT(*) FROM bettors WHERE is_sharp = 1")
+            stats['sharp_bettors'] = cursor.fetchone()[0]
+            
+            # Total sightings
+            cursor.execute("SELECT COUNT(*) FROM whale_sightings")
+            stats['total_sightings'] = cursor.fetchone()[0]
+            
+            # Recent sightings (last 24h)
+            yesterday = datetime.utcnow() - timedelta(days=1)
+            cursor.execute("""
+                SELECT COUNT(*) FROM whale_sightings 
+                WHERE first_seen > ?
+            """, (yesterday,))
+            stats['recent_sightings'] = cursor.fetchone()[0]
+            
+            return stats
 
 class TwitterBot:
     """Handles Twitter/X posting functionality"""
