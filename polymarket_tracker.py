@@ -112,27 +112,27 @@ class PolymarketAPI:
             await self.session.close()
             
     async def get_sports_markets(self) -> List[Dict]:
-        """Fetch only sports markets with proper filtering"""
+        """Fetch only actual game markets, not futures"""
         try:
             all_markets = []
             
-            # Define sports and their keywords
-            sports_config = {
-                'NFL': ['nfl', 'football', 'touchdown', 'quarterback', 'super bowl'],
-                'NBA': ['nba', 'basketball', 'points', 'rebounds', 'lakers', 'celtics'],
-                'MLB': ['mlb', 'baseball', 'home run', 'pitcher', 'world series'],
-                'NHL': ['nhl', 'hockey', 'goal', 'stanley cup'],
-                'SOCCER': ['soccer', 'football', 'goal', 'premier league', 'champions league'],
-                'UFC': ['ufc', 'mma', 'fight', 'knockout'],
-                'BOXING': ['boxing', 'fight', 'knockout', 'round']
-            }
+            # Game-specific keywords that indicate actual matchups
+            game_keywords = ['vs', 'versus', '@', ' at ', 'beat', 'defeat']
+            
+            # Future/championship keywords to EXCLUDE
+            exclude_keywords = [
+                'champion', 'championship', 'win the', 'winner', 'mvp', 
+                'finals', 'super bowl', 'world series', 'stanley cup',
+                'season', 'playoffs', 'conference', 'division',
+                'total', 'over', 'under', 'award', 'rookie'
+            ]
             
             # Fetch markets
             url = f"{POLYMARKET_API_BASE}/events"
             params = {
                 "active": "true",
                 "closed": "false",
-                "limit": 500  # Get more to filter
+                "limit": 500
             }
             
             async with self.session.get(url, params=params) as response:
@@ -144,30 +144,59 @@ class PolymarketAPI:
                         description = event.get('description', '').lower()
                         slug = event.get('slug', '').lower()
                         
+                        # Skip if it contains future/championship keywords
+                        if any(exclude_word in title for exclude_word in exclude_keywords):
+                            continue
+                            
+                        # Must contain game indicators (vs, @, etc.)
+                        if not any(game_word in title for game_word in game_keywords):
+                            continue
+                        
                         # Check if it's a sports market
-                        for sport, keywords in sports_config.items():
-                            if any(keyword in title or keyword in description or keyword in slug 
-                                  for keyword in keywords):
-                                # Additional filtering - must contain game/match indicators
-                                game_indicators = ['vs', 'versus', 'beat', 'win', 'game', 'match', 
-                                                 'championship', 'league', 'season', 'score']
-                                if any(indicator in title for indicator in game_indicators):
-                                    event['category'] = sport
-                                    all_markets.append(event)
-                                    break
-                                    
-            # Filter out non-sports that slipped through
-            filtered_markets = []
-            exclude_keywords = ['politics', 'election', 'president', 'congress', 'senate', 
-                              'crypto', 'bitcoin', 'ethereum', 'stock', 'economy']
-            
+                        sports_indicators = [
+                            'nba', 'nfl', 'mlb', 'nhl', 'soccer', 'football',
+                            'basketball', 'baseball', 'hockey', 'game', 'match',
+                            'lakers', 'celtics', 'yankees', 'cowboys', 'patriots'
+                        ]
+                        
+                        if any(sport in title or sport in description for sport in sports_indicators):
+                            # Additional check: should have a date or "tonight", "today", "tomorrow"
+                            time_indicators = [
+                                'tonight', 'today', 'tomorrow', 'monday', 'tuesday', 
+                                'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+                                'jan', 'feb', 'mar', 'apr', 'may', 'jun', 
+                                'jul', 'aug', 'sep', 'oct', 'nov', 'dec'
+                            ]
+                            
+                            # Categorize by sport
+                            if 'nba' in title or 'basketball' in title:
+                                category = 'NBA'
+                            elif 'nfl' in title or 'football' in title:
+                                category = 'NFL'
+                            elif 'mlb' in title or 'baseball' in title:
+                                category = 'MLB'
+                            elif 'nhl' in title or 'hockey' in title:
+                                category = 'NHL'
+                            elif 'soccer' in title or 'mls' in title or 'premier' in title:
+                                category = 'SOCCER'
+                            else:
+                                category = 'SPORTS'
+                                
+                            event['category'] = category
+                            all_markets.append(event)
+                            logger.debug(f"Added game market: {event.get('title')}")
+                            
+            # Final filter - only actual games
+            game_markets = []
             for market in all_markets:
-                title = market.get('title', '').lower()
-                if not any(keyword in title for keyword in exclude_keywords):
-                    filtered_markets.append(market)
+                title = market.get('title', '')
+                # Pattern matching for actual games
+                # Examples: "Lakers vs Celtics", "Cowboys @ Giants", "Liverpool beat Man City"
+                if any(pattern in title for pattern in [' vs ', ' v ', ' @ ', ' at ', ' beat ', ' defeat ']):
+                    game_markets.append(market)
                     
-            logger.info(f"Found {len(filtered_markets)} sports markets after filtering")
-            return filtered_markets
+            logger.info(f"Found {len(game_markets)} actual game markets (excluded {len(all_markets) - len(game_markets)} futures)")
+            return game_markets
             
         except Exception as e:
             logger.error(f"Error fetching sports markets: {e}")
