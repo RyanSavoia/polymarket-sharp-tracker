@@ -255,23 +255,99 @@ class PolymarketScraper:
             logger.error(f"Error scraping leaderboard: {e}")
             return []
             
-    def check_market_for_whales(self, market_url: str, target_wallets: Set[str]) -> List[str]:
-        """Check if any target whales are in this market"""
+    def check_market_for_whales(self, market_url: str, target_wallets: Set[str]) -> List[Tuple[str, str, str]]:
+        """Check if any target whales are in this market and which side they bet"""
         try:
             logger.info(f"Checking market for known whales: {market_url}")
             self.driver.get(market_url)
             
-            time.sleep(2)
+            time.sleep(3)
+            
+            # First, get the market question to understand what YES/NO means
+            market_question = None
+            try:
+                # Try different selectors for the market title/question
+                question_selectors = [
+                    "h1", 
+                    "[class*='market-title']",
+                    "[class*='question']",
+                    "[class*='header'] h1",
+                    ".c-market-header-title"
+                ]
+                
+                for selector in question_selectors:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    if elements and elements[0].text:
+                        market_question = elements[0].text
+                        logger.info(f"Market question: {market_question}")
+                        break
+            except Exception as e:
+                logger.debug(f"Could not find market question: {e}")
             
             found_whales = []
-            links = self.driver.find_elements(By.TAG_NAME, "a")
             
-            for link in links:
-                href = link.get_attribute('href')
-                if href and '/profile/0x' in href:
-                    wallet = href.split('/profile/')[-1].split('?')[0].lower()
-                    if wallet in target_wallets:
-                        found_whales.append(wallet)
+            # Look for YES and NO outcome sections
+            try:
+                # Find outcome cards/sections
+                outcome_selectors = [
+                    "[class*='outcome']",
+                    "[class*='position-card']",
+                    "[class*='market-card']",
+                    ".c-outcome"
+                ]
+                
+                for selector in outcome_selectors:
+                    outcome_elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    
+                    for outcome in outcome_elements:
+                        outcome_text = outcome.text
+                        
+                        # Determine if this is YES or NO section
+                        is_yes_section = 'yes' in outcome_text.lower() and 'no' not in outcome_text.lower()
+                        is_no_section = 'no' in outcome_text.lower() and 'yes' not in outcome_text.lower()
+                        
+                        if not (is_yes_section or is_no_section):
+                            continue
+                            
+                        side = 'YES' if is_yes_section else 'NO'
+                        
+                        # Now look for wallet addresses in this section
+                        links = outcome.find_elements(By.TAG_NAME, "a")
+                        for link in links:
+                            href = link.get_attribute('href')
+                            if href and '/profile/0x' in href:
+                                wallet = href.split('/profile/')[-1].split('?')[0].lower()
+                                if wallet in target_wallets:
+                                    found_whales.append((wallet, side, market_question))
+                                    logger.info(f"Found whale {wallet[:8]}... betting {side}")
+            except Exception as e:
+                logger.debug(f"Error parsing outcomes: {e}")
+            
+            # Fallback: check all profile links if we didn't find them in outcome sections
+            if not found_whales:
+                links = self.driver.find_elements(By.TAG_NAME, "a")
+                for link in links:
+                    href = link.get_attribute('href')
+                    if href and '/profile/0x' in href:
+                        wallet = href.split('/profile/')[-1].split('?')[0].lower()
+                        if wallet in target_wallets:
+                            # Try to find YES/NO context
+                            try:
+                                # Check parent elements for YES/NO text
+                                parent = link
+                                for _ in range(3):  # Check up to 3 levels up
+                                    parent = parent.find_element(By.XPATH, "./..")
+                                    parent_text = parent.text
+                                    if 'YES' in parent_text and 'NO' not in parent_text:
+                                        found_whales.append((wallet, 'YES', market_question))
+                                        break
+                                    elif 'NO' in parent_text and 'YES' not in parent_text:
+                                        found_whales.append((wallet, 'NO', market_question))
+                                        break
+                                else:
+                                    found_whales.append((wallet, 'UNKNOWN', market_question))
+                            except:
+                                found_whales.append((wallet, 'UNKNOWN', market_question))
                         
             if found_whales:
                 logger.info(f"Found {len(found_whales)} known whales in this market")
@@ -506,20 +582,29 @@ class DatabaseManager:
             """)
             return set(row[0] for row in cursor.fetchall())
             
-    def record_whale_sighting(self, wallet_address: str, market_url: str, category: str):
-        """Record that a whale was seen in a market"""
+    def record_whale_sighting(self, wallet_address: str, market_url: str, category: str, side: str = 'UNKNOWN', question: str = None):
+        """Record that a whale was seen in a market with their position side"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             
+            # First add the columns if they don't exist
+            cursor.execute("PRAGMA table_info(whale_sightings)")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            if 'side' not in columns:
+                cursor.execute("ALTER TABLE whale_sightings ADD COLUMN side TEXT DEFAULT 'UNKNOWN'")
+            if 'market_question' not in columns:
+                cursor.execute("ALTER TABLE whale_sightings ADD COLUMN market_question TEXT")
+            
             cursor.execute("""
                 INSERT OR REPLACE INTO whale_sightings 
-                (wallet_address, market_url, market_category, first_seen, last_seen)
+                (wallet_address, market_url, market_category, side, market_question, first_seen, last_seen)
                 VALUES (
-                    ?, ?, ?,
+                    ?, ?, ?, ?, ?,
                     COALESCE((SELECT first_seen FROM whale_sightings WHERE wallet_address = ? AND market_url = ?), ?),
                     ?
                 )
-            """, (wallet_address, market_url, category, wallet_address, market_url, datetime.utcnow(), datetime.utcnow()))
+            """, (wallet_address, market_url, category, side, question, wallet_address, market_url, datetime.utcnow(), datetime.utcnow()))
             
             conn.commit()
             
@@ -535,10 +620,13 @@ class DatabaseManager:
                     ws.wallet_address,
                     ws.market_url,
                     ws.market_category,
+                    ws.side,
+                    ws.market_question,
                     b.username,
                     b.total_pnl,
                     b.roi,
                     b.positions_value,
+                    b.total_volume,
                     ws.first_seen,
                     b.leaderboard_rank
                 FROM whale_sightings ws
@@ -560,12 +648,15 @@ class DatabaseManager:
                     'wallet_address': row[0],
                     'market_url': row[1],
                     'market_category': row[2],
-                    'username': row[3],
-                    'total_pnl': row[4],
-                    'roi': row[5],
-                    'positions_value': row[6],
-                    'timestamp': row[7],
-                    'leaderboard_rank': row[8]
+                    'side': row[3],
+                    'market_question': row[4],
+                    'username': row[5],
+                    'total_pnl': row[6],
+                    'roi': row[7],
+                    'positions_value': row[8],
+                    'total_volume': row[9],
+                    'timestamp': row[10],
+                    'leaderboard_rank': row[11]
                 })
                 
             return results
@@ -672,24 +763,43 @@ class TwitterBot:
             username = position_data.get('username', 'Whale')
             wallet_short = f"{position_data['wallet_address'][:6]}...{position_data['wallet_address'][-4:]}"
             
-            # Extract market title from URL
+            # Extract market info
             market_slug = position_data['market_url'].split('/')[-1]
-            market_title = market_slug.replace('-', ' ').title()[:50]
-            
+            market_question = position_data.get('market_question')
+            side = position_data.get('side', 'UNKNOWN')
             category = position_data.get('market_category', 'SPORTS')
-            rank = position_data.get('leaderboard_rank')
             
-            rank_text = f"🏅 Rank #{rank} " if rank else ""
+            # Get volume for context
+            volume = position_data.get('total_volume', 0)
+            pnl = position_data.get('total_pnl', 0)
+            
+            # Format the bet description based on what we know
+            if market_question and side != 'UNKNOWN':
+                # We have the full question, so we can be specific
+                if 'lakers' in market_question.lower() and 'celtics' in market_question.lower():
+                    # Example: "Will the Lakers beat the Celtics?"
+                    if 'lakers beat' in market_question.lower() or 'lakers win' in market_question.lower():
+                        team = 'Lakers' if side == 'YES' else 'Celtics'
+                    else:
+                        team = 'Celtics' if side == 'YES' else 'Lakers'
+                    bet_description = f"{team} to win"
+                else:
+                    # For other markets, show question + side
+                    bet_description = f"{market_question} ({side})"
+            else:
+                # Fallback to basic format
+                market_title = market_slug.replace('-', ' ').title()[:50]
+                bet_description = market_title
             
             message = f"""🐋 SHARP BETTOR ALERT
 
 {username} ({wallet_short})
-{rank_text}💰 P&L: +${position_data['total_pnl']:,.0f}
-📊 ROI: {position_data['roi']:.1f}%
+✅ Profitable after ${volume:,.0f} in bets
+💰 Lifetime Profit: +${pnl:,.0f}
 
-New {category} position:
-📍 {market_title}
-💵 Value: ${position_data['positions_value']:,.0f}
+Dropped a MEGA bet on:
+📍 {bet_description}
+💵 Size: ${position_data['positions_value']:,.0f}
 
 #Polymarket #SharpMoney #{category}"""
 
@@ -821,8 +931,8 @@ class PolymarketTracker:
                             logger.info(f"🎯 Found {len(found_whales)} whales in {market.get('title', 'Unknown')}")
                             whales_found += len(found_whales)
                             
-                            for wallet in found_whales:
-                                self.db.record_whale_sighting(wallet, market_url, category)
+                            for wallet, side, question in found_whales:
+                                self.db.record_whale_sighting(wallet, market_url, category, side, question)
                                 
                         # Optionally check top holders if not enough whales found
                         elif not SCAN_KNOWN_WHALES_ONLY and markets_checked < 20:
