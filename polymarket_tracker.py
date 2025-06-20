@@ -112,137 +112,95 @@ class PolymarketAPI:
             await self.session.close()
             
     async def get_sports_markets(self) -> List[Dict]:
-        """Fetch sports markets from Polymarket's API"""
+        """Fetch ONLY sports game markets using Polymarket's actual format"""
         try:
             all_markets = []
             
-            # Try different API parameter combinations
-            param_sets = [
-                {"group": "sports", "active": "true", "closed": "false"},
-                {"tag": "MLB", "active": "true", "closed": "false"},
-                {"tag": "NBA", "active": "true", "closed": "false"},
-                {"tag": "NFL", "active": "true", "closed": "false"},
-                {"tag": "NHL", "active": "true", "closed": "false"},
-                {"active": "true", "closed": "false", "limit": 500}  # Get all and filter
-            ]
+            # Get all markets
+            url = f"{POLYMARKET_API_BASE}/markets"
+            params = {"active": "true", "closed": "false", "limit": 1000}
             
-            seen_ids = set()
-            
-            for params in param_sets:
-                url = f"{POLYMARKET_API_BASE}/markets"  # Try /markets endpoint
-                
-                try:
-                    async with self.session.get(url, params=params) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            logger.info(f"API call with params {params} returned {len(data) if isinstance(data, list) else 'non-list'} items")
-                            
-                            if isinstance(data, list):
-                                for market in data:
-                                    market_id = market.get('id')
-                                    if market_id and market_id not in seen_ids:
-                                        seen_ids.add(market_id)
-                                        
-                                        title = market.get('question', market.get('title', '')).lower()
-                                        slug = market.get('slug', '').lower()
-                                        
-                                        # Log first few to see structure
-                                        if len(all_markets) < 3:
-                                            logger.info(f"Sample market: title='{title}', slug='{slug}'")
-                                        
-                                        # Look for sports games
-                                        is_sports = any(sport in title or sport in slug for sport in 
-                                                      ['mlb', 'nba', 'nfl', 'nhl', 'baseball', 'basketball', 
-                                                       'football', 'hockey', 'game', 'match', ' vs ', ' @ '])
-                                        
-                                        # STRICT exclusion for any futures/props
-                                        exclude_keywords = [
-                                            'championship', 'champion', 'season', 'mvp', 'winner',
-                                            'playoffs', 'finals', 'award', 'draft', 'super bowl',
-                                            'world series', 'stanley cup', 'title', 'tournament',
-                                            'conference', 'division', 'wildcard', 'all-star',
-                                            'rookie', 'coach', 'manager', 'total', 'over', 'under',
-                                            'prop', 'future', 'outright', 'series', 'sweep',
-                                            'win the', 'make the', 'reach the', 'clinch',
-                                            'player', 'team to', 'first to', 'last to',
-                                            'will win', 'to win', 'winning', 'finishes'
-                                        ]
-                                        
-                                        # Must have game indicators
-                                        has_game_indicator = any(indicator in title for indicator in 
-                                                               [' vs ', ' v ', ' @ ', ' at ', 'game ', 'match ',
-                                                                'beat ', 'defeat ', 'tonight', 'today'])
-                                        
-                                        # Check for futures in title
-                                        has_excluded_word = any(exclude in title for exclude in exclude_keywords)
-                                        
-                                        if is_sports and has_game_indicator and not has_excluded_word:
-                                            # Additional check - should NOT have year in future
-                                            if '2025' in title or '2026' in title:
-                                                continue
-                                                
-                                            # Log what we're accepting
-                                            logger.info(f"Accepted game market: {title[:80]}")
-                                            
-                                            # Categorize
-                                            if 'mlb' in title or 'baseball' in title:
-                                                market['category'] = 'MLB'
-                                            elif 'nba' in title or 'basketball' in title:
-                                                market['category'] = 'NBA'
-                                            elif 'nfl' in title or 'football' in title:
-                                                market['category'] = 'NFL'
-                                            elif 'nhl' in title or 'hockey' in title:
-                                                market['category'] = 'NHL'
-                                            else:
-                                                market['category'] = 'SPORTS'
-                                                
-                                            all_markets.append(market)
-                except Exception as e:
-                    logger.debug(f"API call failed with params {params}: {e}")
+            async with self.session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logger.info(f"API returned {len(data)} total markets")
                     
-                await asyncio.sleep(0.5)
-            
-            # Also try the /events endpoint
-            try:
-                url = f"{POLYMARKET_API_BASE}/events"
-                params = {"active": "true", "closed": "false", "limit": 200}
-                
-                async with self.session.get(url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        logger.info(f"Events endpoint returned {len(data) if isinstance(data, list) else 'non-list'} items")
+                    for market in data:
+                        title = market.get('question', market.get('title', '')).lower()
+                        slug = market.get('slug', '').lower()
                         
-                        if isinstance(data, list):
-                            for event in data:
-                                # Events might have markets inside them
-                                markets = event.get('markets', [])
-                                if markets:
-                                    for market in markets:
-                                        market_id = market.get('id')
-                                        if market_id and market_id not in seen_ids:
-                                            seen_ids.add(market_id)
-                                            
-                                            title = market.get('question', market.get('title', '')).lower()
-                                            
-                                            # Same filtering logic
-                                            is_sports = any(sport in title for sport in 
-                                                          ['mlb', 'nba', 'nfl', 'nhl', 'game', ' vs ', ' @ '])
-                                            is_future = any(future in title for future in 
-                                                          ['championship', 'season', 'mvp', 'winner'])
-                                            
-                                            if is_sports and not is_future:
-                                                market['event_title'] = event.get('title', '')
-                                                market['category'] = 'SPORTS'
-                                                all_markets.append(market)
-            except Exception as e:
-                logger.debug(f"Events endpoint failed: {e}")
-            
-            logger.info(f"Found {len(all_markets)} sports game markets total")
-            
-            # If no markets found, log more details
-            if len(all_markets) == 0:
-                logger.warning("No sports markets found. Check API response structure.")
-                
+                        # Look for team abbreviations in slug/title
+                        # MLB: tex, nyy, bal, pit, etc.
+                        # NBA: lal, bos, gsw, etc.
+                        # NFL: dal, ne, gb, etc.
+                        
+                        # Common team abbreviations
+                        team_abbreviations = [
+                            # MLB
+                            'nyy', 'bos', 'bal', 'tb', 'tor', 'cws', 'cle', 'det', 
+                            'kc', 'min', 'hou', 'oak', 'sea', 'tex', 'laa', 'atl',
+                            'mia', 'nym', 'phi', 'was', 'chc', 'cin', 'mil', 'pit',
+                            'stl', 'ari', 'col', 'la', 'sd', 'sf',
+                            # NBA
+                            'atl', 'bos', 'bkn', 'cha', 'chi', 'cle', 'dal', 'den',
+                            'det', 'gsw', 'hou', 'ind', 'lac', 'lal', 'mem', 'mia',
+                            'mil', 'min', 'no', 'ny', 'okc', 'orl', 'phi', 'phx',
+                            'por', 'sac', 'sa', 'tor', 'uta', 'was',
+                            # NFL
+                            'ari', 'atl', 'bal', 'buf', 'car', 'chi', 'cin', 'cle',
+                            'dal', 'den', 'det', 'gb', 'hou', 'ind', 'jax', 'kc',
+                            'lv', 'lac', 'lar', 'mia', 'min', 'ne', 'no', 'nyg',
+                            'nyj', 'phi', 'pit', 'sf', 'sea', 'tb', 'ten', 'was',
+                            # NHL
+                            'ana', 'ari', 'bos', 'buf', 'cgy', 'car', 'chi', 'col',
+                            'cbj', 'dal', 'det', 'edm', 'fla', 'la', 'min', 'mtl',
+                            'nsh', 'nj', 'nyi', 'nyr', 'ott', 'phi', 'pit', 'sj',
+                            'stl', 'tb', 'tor', 'van', 'vgk', 'wpg', 'wsh'
+                        ]
+                        
+                        # Count team abbreviations found
+                        teams_found = sum(1 for team in team_abbreviations if team in slug or team in title)
+                        
+                        # Look for sport indicators in slug
+                        has_mlb = 'mlb' in slug or 'baseball' in title
+                        has_nba = 'nba' in slug or 'basketball' in title
+                        has_nfl = 'nfl' in slug or 'football' in title
+                        has_nhl = 'nhl' in slug or 'hockey' in title
+                        
+                        has_sport = has_mlb or has_nba or has_nfl or has_nhl
+                        
+                        # BANNED words - absolutely no politics or futures
+                        banned_words = [
+                            'trump', 'biden', 'election', 'president', 'politics',
+                            'championship', 'finals', 'mvp', 'season', 'futures',
+                            'winner', 'win', 'draft', 'award', 'total', 'prop'
+                        ]
+                        
+                        has_banned = any(banned in title or banned in slug for banned in banned_words)
+                        
+                        # Accept if: has sport indicator AND has 2+ team abbreviations AND no banned words
+                        if has_sport and teams_found >= 2 and not has_banned:
+                            logger.info(f"✅ ACCEPTED game: {title[:60]} | slug: {slug[:40]}")
+                            
+                            # Categorize
+                            if has_mlb:
+                                market['category'] = 'MLB'
+                            elif has_nba:
+                                market['category'] = 'NBA'
+                            elif has_nfl:
+                                market['category'] = 'NFL'
+                            elif has_nhl:
+                                market['category'] = 'NHL'
+                                
+                            all_markets.append(market)
+                            
+                        # Log rejections for debugging
+                        elif 'trump' in title or 'election' in title:
+                            logger.debug(f"❌ Rejected politics: {title[:40]}")
+                        elif teams_found < 2:
+                            logger.debug(f"❌ Rejected - not enough teams: {title[:40]}")
+                            
+            logger.info(f"Filtered to {len(all_markets)} actual sports games")
             return all_markets
             
         except Exception as e:
