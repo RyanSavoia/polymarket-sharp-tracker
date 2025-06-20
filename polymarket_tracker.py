@@ -27,6 +27,8 @@ import schedule
 from decimal import Decimal
 import sqlite3
 from dotenv import load_dotenv
+from flask import Flask
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -54,6 +56,33 @@ SCAN_LEADERBOARD = os.getenv('SCAN_LEADERBOARD', 'true').lower() == 'true'
 SCAN_KNOWN_WHALES_ONLY = os.getenv('SCAN_KNOWN_WHALES_ONLY', 'false').lower() == 'true'
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', '10'))
 MAX_NEW_WALLETS_PER_SCAN = int(os.getenv('MAX_NEW_WALLETS_PER_SCAN', '10'))
+
+# Create a simple web server for health checks
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return 'Polymarket Sharp Bettor Tracker is running!', 200
+
+@app.route('/status')
+def status():
+    """Return bot status"""
+    try:
+        db = DatabaseManager()
+        stats = db.get_scanning_stats()
+        return {
+            'status': 'running',
+            'sharp_bettors': stats.get('sharp_bettors', 0),
+            'total_bettors': stats.get('total_bettors', 0),
+            'total_sightings': stats.get('total_sightings', 0)
+        }, 200
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}, 500
+
+def run_flask():
+    """Run Flask server for health checks"""
+    port = int(os.getenv('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
 
 @dataclass
 class BettorProfile:
@@ -841,6 +870,12 @@ class PolymarketTracker:
 
 def main():
     """Main entry point"""
+    # Start Flask in a separate thread for health checks
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    logger.info("🌐 Health check server started")
+    
     # Load configuration
     twitter_creds = {
         'api_key': os.getenv('TWITTER_API_KEY'),
