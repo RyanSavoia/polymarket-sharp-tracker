@@ -192,3 +192,13 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# Custom additions for Polymarket tracker
+.env
+.env.*
+*.db
+polymarket_tracker.db
+chromedriver*
+geckodriver*
+sharp_bettors.json
+exports/
+data/
